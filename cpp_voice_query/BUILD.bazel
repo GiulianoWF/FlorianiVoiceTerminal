@@ -1,0 +1,154 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+# System PortAudio (sudo apt install libportaudio2 portaudio19-dev)
+cc_library(
+    name = "portaudio",
+    linkopts = ["-lportaudio"],
+)
+
+# System libcurl (sudo apt install libcurl4-openssl-dev)
+cc_library(
+    name = "curl",
+    linkopts = ["-lcurl"],
+)
+
+# Bundled nlohmann/json (header-only)
+cc_library(
+    name = "nlohmann_json",
+    hdrs = ["include/nlohmann/json.hpp"],
+    strip_include_prefix = "include",
+)
+
+# Bundled cpp-httplib (header-only)
+cc_library(
+    name = "httplib",
+    hdrs = ["include/httplib/httplib.h"],
+    strip_include_prefix = "include",
+)
+
+# PortAudioSource (header-only, implements AudioSource for WhisperStream)
+cc_library(
+    name = "port_audio_source",
+    hdrs = ["PortAudioSource.h"],
+    deps = [
+        ":portaudio",
+        "@cpp_whisper//:whisper_stream",
+    ],
+)
+
+# Sentence splitter (header-only, shared by LLM client and inbound server)
+cc_library(
+    name = "sentence_splitter",
+    hdrs = ["SentenceSplitter.h"],
+)
+
+# LLM client (streams responses via libcurl)
+cc_library(
+    name = "llm_client",
+    srcs = ["LlmClient.cpp"],
+    hdrs = ["LlmClient.h"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":curl",
+        ":nlohmann_json",
+        ":sentence_splitter",
+    ],
+)
+
+# Data types
+cc_library(
+    name = "speech_request",
+    hdrs = ["SpeechRequest.h"],
+)
+
+cc_library(
+    name = "voice_channel",
+    hdrs = ["VoiceChannel.h"],
+    deps = [":speech_request"],
+)
+
+# TTS engine (wraps Kokoro + Tokenizer with voice switching)
+cc_library(
+    name = "tts_engine",
+    srcs = ["TtsEngine.cpp"],
+    hdrs = ["TtsEngine.h"],
+    copts = ["-std=c++17"],
+    deps = [
+        "@kokoro_tts//:kokoro_inference",
+        "@kokoro_tts//:tokenizer",
+    ],
+)
+
+# Priority playback queue (text → TTS → speaker, with priority interruption)
+cc_library(
+    name = "priority_playback_queue",
+    srcs = ["PriorityPlaybackQueue.cpp"],
+    hdrs = ["PriorityPlaybackQueue.h"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":speech_request",
+        ":tts_engine",
+    ],
+)
+
+# HTTP server (exposes /speak/{channel} endpoints)
+cc_library(
+    name = "inbound_server",
+    srcs = ["InboundServer.cpp"],
+    hdrs = ["InboundServer.h"],
+    copts = ["-std=c++17"],
+    deps = [
+        ":httplib",
+        ":nlohmann_json",
+        ":priority_playback_queue",
+        ":sentence_splitter",
+        ":voice_channel",
+    ],
+)
+
+# Main voice query binary
+cc_binary(
+    name = "voice_query",
+    srcs = ["main.cpp"],
+    copts = ["-std=c++17"],
+    linkopts = [
+        "-lgomp",
+        "-L/usr/local/cuda-12.8/lib64",
+        "-lcudart",
+        "-lcublas",
+        "-lcublasLt",
+        "-lcuda",
+    ],
+    deps = [
+        ":inbound_server",
+        ":llm_client",
+        ":port_audio_source",
+        ":priority_playback_queue",
+        ":speech_request",
+        ":tts_engine",
+        ":voice_channel",
+        "@cpp_whisper//:whisper_stream",
+        "@kokoro_tts//:audio_player",
+    ],
+)
+
+# Wrapper that downloads models and invokes voice_query with correct paths.
+# Usage: bazel run //:voice_query_run -- --language en
+sh_binary(
+    name = "voice_query_run",
+    srcs = ["run_voice_query.sh"],
+    args = [
+        "$(rlocationpath :voice_query)",
+        "$(rlocationpath @cpp_whisper//:selected_model)",
+        "$(rlocationpath @kokoro_tts//:download_model)",
+        "$(rlocationpath @kokoro_tts//:download_voice_pt)",
+    ],
+    data = [
+        ":voice_query",
+        "@cpp_whisper//:selected_model",
+        "@kokoro_tts//:download_model",
+        "@kokoro_tts//:download_voice_pt",
+    ],
+)

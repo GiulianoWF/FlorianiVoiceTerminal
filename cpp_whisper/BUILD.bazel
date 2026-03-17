@@ -1,0 +1,152 @@
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "cmake")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+# Build the whisper.cpp submodule using its own CMake build system.
+# The cmake() rule invokes CMake in a sandbox, producing static libraries.
+#
+# NOTE: If CUDA is available and you want GPU support, add to out_static_libs:
+#   "libggml-cuda.a"
+# and to cache_entries:
+#   "GGML_CUDA": "ON",
+cmake(
+    name = "whisper_cpp",
+    build_args = ["-j30"],
+    cache_entries = {
+        "BUILD_SHARED_LIBS": "OFF",
+        "CMAKE_BUILD_TYPE": "Release",
+        "WHISPER_BUILD_EXAMPLES": "OFF",
+        "WHISPER_BUILD_TESTS": "OFF",
+        "WHISPER_BUILD_SERVER": "OFF",
+        "WHISPER_STANDALONE": "OFF",
+        "GGML_CUDA": "ON",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda-12.8/bin/nvcc",
+    },
+    lib_source = "@whisper_cpp_src//:all_srcs",
+    out_include_dir = "include",
+    out_static_libs = [
+        "libwhisper.a",
+        "libggml.a",
+        "libggml-base.a",
+        "libggml-cpu.a",
+        "libggml-cuda.a",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# System PortAudio library (portaudio-2.0 must be installed via your package manager).
+# portaudio.h is on the default system include path; we just need to link the library.
+cc_library(
+    name = "portaudio",
+    linkopts = ["-lportaudio"],
+    visibility = ["//visibility:public"],
+)
+
+# Streaming transcription library (no audio device dependency — suitable for embedding).
+cc_library(
+    name = "whisper_stream",
+    srcs = ["whisper_stream.cpp"],
+    hdrs = ["whisper_stream.h"],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+    deps = [":whisper_cpp"],
+)
+
+# CLI executable: captures microphone audio via PortAudio and streams it through whisper_stream.
+cc_binary(
+    name = "whisper_stt",
+    srcs = ["main.cpp"],
+    copts = ["-std=c++17"],
+    linkopts = [
+        "-lgomp",
+        "-L/usr/local/cuda-12.8/lib64",
+        "-lcudart",
+        "-lcublas",
+        "-lcublasLt",
+        "-lcuda",
+    ],
+    deps = [
+        ":portaudio",
+        ":whisper_stream",
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# Model download rules
+# Usage: bazel build //:download_ggml-large-v3
+# ---------------------------------------------------------------------------
+[genrule(
+    name = "download_" + model,
+    outs = ["models/" + model + ".bin"],
+    cmd = "curl -L -o $@ https://huggingface.co/ggerganov/whisper.cpp/resolve/main/" + model + ".bin",
+    tags = [
+        "no-sandbox",
+        "requires-network",
+    ],
+    visibility = ["//visibility:public"],
+) for model in [
+    "ggml-base",
+    "ggml-small",
+    "ggml-large-v3",
+    "ggml-large-v3-turbo",
+]]
+
+# ---------------------------------------------------------------------------
+# Model selection via --define whisper_model=<variant>
+# Default: large-v3
+# Values:  base | small | large-v3 | large-v3-turbo
+#
+# Example:
+#   bazel run //:whisper_stt_run -- -gpu --stable 3
+#   bazel run //:whisper_stt_run --define whisper_model=small -- -gpu --stable 3
+# ---------------------------------------------------------------------------
+config_setting(
+    name = "model_is_base",
+    define_values = {"whisper_model": "base"},
+)
+
+config_setting(
+    name = "model_is_small",
+    define_values = {"whisper_model": "small"},
+)
+
+config_setting(
+    name = "model_is_large_v3_turbo",
+    define_values = {"whisper_model": "large-v3-turbo"},
+)
+
+# Resolves to the correct downloaded model file based on --define
+filegroup(
+    name = "whisper_model_file",
+    srcs = select({
+        ":model_is_base": [":download_ggml-base"],
+        ":model_is_small": [":download_ggml-small"],
+        ":model_is_large_v3_turbo": [":download_ggml-large-v3-turbo"],
+        "//conditions:default": [":download_ggml-large-v3"],
+    }),
+)
+
+# Copies the selected model to a fixed name so the wrapper script always
+# finds it at models/selected_model.bin regardless of which variant was chosen.
+genrule(
+    name = "selected_model",
+    srcs = [":whisper_model_file"],
+    outs = ["models/selected_model.bin"],
+    cmd = "cp $< $@",
+    tags = [
+        "no-sandbox",
+        "requires-network",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Wrapper that downloads the model and invokes whisper_stt with -m <model>.
+sh_binary(
+    name = "whisper_stt_run",
+    srcs = ["run_whisper.sh"],
+    data = [
+        ":whisper_stt",
+        ":selected_model",
+    ],
+)

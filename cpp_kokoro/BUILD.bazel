@@ -1,0 +1,110 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_import.bzl", "cc_import")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+
+# ── ONNX Runtime configuration ──────────────────────────────────────
+# Change these to point to your ONNX Runtime installation.
+ONNX_RUNTIME_DIR = "onnx/onnxruntime-linux-x64-gpu-1.24.2"
+ONNX_RUNTIME_LIB_DIR = "/home/giulianowf/Documents/models/cpp_kokoro/" + ONNX_RUNTIME_DIR + "/lib"
+
+# Pre-built ONNX Runtime shared library
+cc_import(
+    name = "onnxruntime_lib",
+    shared_library = ONNX_RUNTIME_DIR + "/lib/libonnxruntime.so.1.24.2",
+)
+
+cc_library(
+    name = "onnxruntime",
+    hdrs = glob([ONNX_RUNTIME_DIR + "/include/**/*.h"]),
+    linkopts = ["-Wl,-rpath," + ONNX_RUNTIME_LIB_DIR],
+    strip_include_prefix = ONNX_RUNTIME_DIR + "/include",
+    deps = [":onnxruntime_lib"],
+)
+
+# System PortAudio (installed via: sudo apt install libportaudio2 portaudio19-dev)
+cc_library(
+    name = "portaudio",
+    linkopts = ["-lportaudio"],
+)
+
+# Tokenizer library (espeak-ng called as subprocess)
+cc_library(
+    name = "tokenizer",
+    srcs = ["Tokenizer.cpp"],
+    hdrs = ["Tokenizer.h"],
+    visibility = ["//visibility:public"],
+)
+
+# Kokoro inference engine
+cc_library(
+    name = "kokoro_inference",
+    srcs = ["KokoroInference.cpp"],
+    hdrs = ["KokoroInference.h"],
+    visibility = ["//visibility:public"],
+    deps = [":onnxruntime"],
+)
+
+# Audio player (header-only)
+cc_library(
+    name = "audio_player",
+    hdrs = ["AudioPlayer.h"],
+    visibility = ["//visibility:public"],
+    deps = [":portaudio"],
+)
+
+# ---------------------------------------------------------------------------
+# Model & voice download rules
+# Usage: bazel build //:download_model   or   bazel build //:download_voice
+# ---------------------------------------------------------------------------
+MODEL_URL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx"
+VOICE_URL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/af.bin"
+VOICE_PT_URL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_santa.bin"
+
+genrule(
+    name = "download_model",
+    outs = ["kokoro-v1.0.onnx"],
+    cmd = "curl -L -o $@ " + MODEL_URL,
+    tags = [
+        "no-sandbox",
+        "requires-network",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "download_voice",
+    outs = ["voices/af.bin"],
+    cmd = "curl -L -o $@ " + VOICE_URL,
+    tags = [
+        "no-sandbox",
+        "requires-network",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "download_voice_pt",
+    outs = ["voices/pm_santa.bin"],
+    cmd = "curl -L -o $@ " + VOICE_PT_URL,
+    tags = [
+        "no-sandbox",
+        "requires-network",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Main binary
+cc_binary(
+    name = "kokoro_tts",
+    srcs = ["main.cpp"],
+    copts = ["-std=c++17"],
+    data = [
+        ":download_model",
+        ":download_voice",
+    ],
+    deps = [
+        ":audio_player",
+        ":kokoro_inference",
+        ":tokenizer",
+    ],
+)

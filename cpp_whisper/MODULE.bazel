@@ -1,0 +1,38 @@
+module(
+    name = "cpp_whisper",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "pkg-config", version = "0.29.2")
+
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "whisper_cpp_src",
+    urls = ["https://github.com/ggerganov/whisper.cpp/archive/30c5194c9691e4e9a98b3dea9f19727397d3f46e.tar.gz"],
+    strip_prefix = "whisper.cpp-30c5194c9691e4e9a98b3dea9f19727397d3f46e",
+    integrity = "sha256-qQPtoIzrVysQbLd5yRRB4seGy0KV9fSc5vGibQAbVQ8=",
+    build_file_content = """
+filegroup(
+    name = "all_srcs",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "**/.git/**",
+            "**/*.md",
+        ],
+    ),
+    visibility = ["//visibility:public"],
+)
+""",
+    patch_cmds = [
+        # Force WHISPER_STANDALONE OFF to skip git-vars and configure_file
+        # that write into the read-only source tree in Bazel's sandbox.
+        """sed -i 's|if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)|if (FALSE)|' CMakeLists.txt""",
+    ],
+)

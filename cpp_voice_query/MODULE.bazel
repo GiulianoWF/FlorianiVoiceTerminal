@@ -1,0 +1,21 @@
+module(
+    name = "cpp_voice_query",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "wolfd_bazel_compile_commands", version = "0.5.2")
+
+# Sibling projects — use local_path_override for development
+bazel_dep(name = "cpp_whisper", version = "0.1.0")
+local_path_override(
+    module_name = "cpp_whisper",
+    path = "../cpp_whisper",
+)
+
+bazel_dep(name = "kokoro_tts", version = "1.0.0")
+local_path_override(
+    module_name = "kokoro_tts",
+    path = "../cpp_kokoro",
+)
