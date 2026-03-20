@@ -12,10 +12,13 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <atomic>
 #include <algorithm>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
 // --- Global state ---
 static std::atomic<bool> g_running{true};
@@ -45,6 +48,75 @@ static bool is_exit_word(const std::string& text) {
 
 static constexpr const char* ANSI_RESET = "\033[0m";
 static constexpr const char* ANSI_DIM   = "\033[2m";
+
+// --- Callback POST helper ---
+
+static void post_json_to_url(const std::string& url, const std::string& json_body) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return;
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        std::cerr << "[Callback] POST to " << url << " failed: "
+                  << curl_easy_strerror(res) << std::endl;
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+}
+
+// Capture user speech via STT (with 30s timeout), POST to callback, release queue hold.
+static void capture_and_send_response(WhisperStream& stream, PortAudioSource& audio_source,
+                                      PriorityPlaybackQueue& queue) {
+    std::string callback_url = queue.get_pending_callback_url();
+    if (callback_url.empty()) {
+        queue.complete_response();
+        return;
+    }
+
+    audio_source.clear();
+    std::string response_text;
+    auto start = std::chrono::steady_clock::now();
+
+    std::cout << "[Listening for response...]\n" << std::flush;
+    stream.run([&](const WhisperStreamResult& r) {
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        if (elapsed > std::chrono::seconds(30)) {
+            stream.stop();
+            return;
+        }
+        if (r.finalized) {
+            printf("\33[2K\r%s\n", r.committed.c_str());
+            fflush(stdout);
+            response_text = r.committed;
+            stream.stop();
+        } else {
+            printf("\33[2K\r%s%s%s", ANSI_DIM, r.tentative.c_str(), ANSI_RESET);
+            fflush(stdout);
+        }
+    });
+
+    if (!response_text.empty()) {
+        std::cout << "   Response: " << response_text << std::endl;
+    } else {
+        std::cout << "   [No response — timeout]" << std::endl;
+    }
+
+    nlohmann::json j;
+    j["response"] = response_text;
+    post_json_to_url(callback_url, j.dump());
+
+    queue.complete_response();
+    std::cerr << "[Response sent to " << callback_url << "]" << std::endl;
+}
 
 // --- Configuration ---
 
@@ -254,6 +326,7 @@ int main(int argc, char* argv[]) {
 
     // --- VAD monitor: listens for speech during TTS to interrupt ---
     std::atomic<bool> vad_active{false};
+    std::atomic<bool> llm_interrupt{false};
 
     auto start_vad_monitor = [&]() -> std::thread {
         vad_active = true;
@@ -270,8 +343,16 @@ int main(int argc, char* argv[]) {
                 float rms = std::sqrt(sum / (float)vad_buf.size());
 
                 if (rms > 0.03f) {
+                    // During pending response, speech is the expected answer — don't interrupt
+                    if (queue && queue->has_pending_response()) continue;
+
                     std::cerr << "[VAD] Speech detected (rms=" << rms << "), interrupting" << std::endl;
-                    if (queue) queue->interrupt_current();
+                    if (queue) {
+                        std::string ch = queue->get_current_channel();
+                        if (!ch.empty()) queue->interrupt_channel(ch);
+                        queue->interrupt_channel("mic");  // Always clear LLM sentences
+                    }
+                    llm_interrupt = true;
                     vad_active = false;
                 }
             }
@@ -290,9 +371,43 @@ int main(int argc, char* argv[]) {
     std::cout << "\nReady. Press Ctrl+C to exit.\n" << std::endl;
 
     bool keep_audio = false;
+    std::vector<float> pre_vad_buf;
 
     // --- Main loop: STT → LLM → queue ---
     while (g_running) {
+        // --- Phase 0: Handle pending channel responses ---
+        if (queue && queue->has_pending_response()) {
+            capture_and_send_response(stream, audio_source, *queue);
+            continue;
+        }
+
+        // --- Phase 0.5: Pre-STT VAD — interrupt HTTP channels before entering STT ---
+        if (queue && queue->is_active()) {
+            std::cerr << "[Main] Queue active, monitoring for VAD before STT" << std::endl;
+            while (queue->is_active() && g_running && !queue->has_pending_response()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                int avail = audio_source.available();
+                if (avail < 1600) continue;
+                audio_source.get_audio(1600, pre_vad_buf);
+
+                float sum = 0;
+                for (float s : pre_vad_buf) sum += s * s;
+                float rms = std::sqrt(sum / (float)pre_vad_buf.size());
+
+                if (rms > 0.03f) {
+                    std::cerr << "[VAD-pre] Speech detected, interrupting current channel" << std::endl;
+                    std::string ch = queue->get_current_channel();
+                    if (!ch.empty()) queue->interrupt_channel(ch);
+                    audio_source.clear();
+                    // Don't break — loop back to check if other channels resume
+                }
+            }
+            // If a pending response appeared, handle it at top of loop
+            if (queue->has_pending_response()) continue;
+        }
+
+        if (!g_running) break;
+
         if (!keep_audio) audio_source.clear();
         keep_audio = false;
 
@@ -338,18 +453,25 @@ int main(int argc, char* argv[]) {
             req.priority = Priority::NORMAL;
             req.voice_path = cfg.kokoro_voice;
             req.language = tts_lang;
+            req.channel = "mic";
             queue->submit(std::move(req));
         };
 
         // Start VAD monitor
+        llm_interrupt = false;
         std::thread vad_thread = start_vad_monitor();
 
         // Stream LLM response — on_sentence fires per sentence
-        std::string reply = llm.chat(captured_text, history, on_sentence, nullptr);
+        std::string reply = llm.chat(captured_text, history, on_sentence, &llm_interrupt);
 
-        // Wait for all queued audio to finish playing
+        // Wait for all queued audio to finish playing (or VAD interrupt)
         if (queue) {
             while (queue->is_active() && vad_active) {
+                // If a channel needs a user response, capture it
+                if (queue->has_pending_response()) {
+                    capture_and_send_response(stream, audio_source, *queue);
+                    continue;  // Keep waiting for remaining queue items
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         }
@@ -358,9 +480,10 @@ int main(int argc, char* argv[]) {
         vad_active = false;
         if (vad_thread.joinable()) vad_thread.join();
 
+        bool was_interrupted = llm_interrupt.load();
         g_responding = false;
 
-        if (!queue || !queue->is_active()) {
+        if (!was_interrupted && (!queue || !queue->is_active())) {
             std::cout << "   Assistant: " << reply << std::endl;
         }
     }

@@ -1,6 +1,8 @@
 # cpp_voice_query — Voice Assistant + Multi-Endpoint Voice Server
 
-Voice-in, voice-out assistant that chains STT → LLM → TTS, plus an HTTP server that accepts text from external agents and speaks it with configurable voices and priority-based interruption.
+**IMPORTANT: This file must always be kept up to date when the codebase changes. Any modification to architecture, endpoints, data structures, CLI options, or behavior must be reflected here.**
+
+Voice-in, voice-out assistant that chains STT → LLM → TTS, plus an HTTP server that accepts text from external agents and speaks it with configurable voices, priority-based interruption, and optional response capture via callbacks.
 
 ## Architecture
 
@@ -10,14 +12,25 @@ Agent POST /speak/alert      ──┤──→ PriorityPlaybackQueue ──→ 
 Agent POST /speak/monitor    ──┘         ↑
 Mic → STT → LLM on_sentence ────────────┘
                                   (high prio interrupts low prio)
+                                  (user voice interrupts entire channel)
 ```
 
-Both the mic loop and HTTP endpoints feed into the same priority queue.
+Both the mic loop and HTTP endpoints feed into the same priority queue. Each request is tagged with a channel name for targeted interruption.
 
 ## Voice server endpoints
 
 ### POST /speak/:channel
 Speak complete text. Body: `{"text": "Hello world"}`. Returns 202 Accepted.
+
+Optional fields for response capture:
+```json
+{
+  "text": "Build failed. Should I retry?",
+  "wait_response": true,
+  "callback_url": "http://agent:9000/response"
+}
+```
+When `wait_response` is true, after the text finishes playing the system captures user speech via STT (30s timeout) and POSTs `{"response": "user's answer"}` to `callback_url`.
 
 ### POST /speak/:channel (streaming)
 Speak streamed SSE text. Body: `{"text": "...", "stream": true}`. The body contains OpenAI-format SSE lines. Sentences are split on arrival and TTS starts on the first complete sentence.
@@ -42,47 +55,79 @@ LOW      (0) — monitoring chatter, status updates
 
 When a higher-priority request arrives while a lower-priority one is playing, the current audio is interrupted within ~10ms (256 samples at 24kHz). Same-or-lower priority queues behind.
 
-## LLM interface (unchanged)
+## Voice interruption (VAD)
+
+User speech interrupts playback at two points in the main loop:
+
+1. **During LLM response** (g_responding phase) — VAD monitor thread detects speech via RMS threshold, calls `interrupt_channel()` to clear the entire currently-playing channel plus all "mic" channel items, and sets `llm_interrupt` to abort LLM streaming.
+
+2. **Pre-STT phase** — When HTTP channel items are playing before STT starts, the main thread polls mic input. Speech interrupts the current channel; if other channels have queued items, those resume. Only when the queue is fully empty does STT begin.
+
+Key behaviors:
+- Speaking during playback clears **all items from the interrupted channel**, not just the current sentence
+- After interruption, lower-priority channels resume automatically
+- The interrupt speech is discarded (not sent to the LLM)
+- During a pending response (wait_response hold), speech is treated as the response, not an interrupt
+
+## Wait-for-response flow
+
+When an agent sends `wait_response: true`:
+
+1. Request plays normally via the priority queue
+2. If the item completes without interruption, the queue worker **holds** (doesn't process more items)
+3. Main loop detects the hold, runs STT with 30s timeout to capture user speech
+4. POSTs `{"response": "transcribed text"}` to the callback URL
+5. Releases the hold — queue resumes processing remaining items
+
+If the item is interrupted before finishing (user speaks during playback), `wait_response` is cancelled and no callback is sent.
+
+During the hold, the LLM keeps streaming in the background — sentences queue up and play after the response is captured.
+
+## LLM interface
 
 - `POST /v1/chat/completions` with `{"messages": [...], "stream": true}`
 - SSE stream: `data: {"choices":[{"delta":{"content":"token"}}]}\n\n`
 - End: `data: [DONE]\n\n`
 - Default: `http://localhost:8001` (`--llm-url`)
+- LLM streaming can be aborted via `llm_interrupt` atomic flag (VAD sets it when user speaks)
 
 ## Internal architecture
 
 ```
-main.cpp                    Wiring: init components, start server, run mic loop
-SpeechRequest.h             Data: text + priority + voice + language
+main.cpp                    Wiring: init components, start server, run mic loop, VAD, response capture
+SpeechRequest.h             Data: text + priority + voice + language + channel + wait_response + callback_url
 VoiceChannel.h              Data: channel name → voice + priority + language
 SentenceSplitter.h          Stream of text fragments → stream of sentences
 TtsEngine.h/.cpp            Kokoro + Tokenizer wrapper with runtime voice switching
-PriorityPlaybackQueue.h/.cpp  Thread-safe priority queue → TTS → AudioPlayer
+PriorityPlaybackQueue.h/.cpp  Thread-safe priority queue → TTS → AudioPlayer, channel interruption, response hold
 InboundServer.h/.cpp        HTTP server (cpp-httplib) exposing /speak/{channel}
-LlmClient.h/.cpp            SSE streaming client (libcurl)
+LlmClient.h/.cpp            SSE streaming client (libcurl) with interrupt support
 PortAudioSource.h           Mic input wrapper for WhisperStream
 ```
 
 ### Pipeline per turn (mic path)
 
-1. **STT phase** — WhisperStream listens until silence finalizes an utterance
-2. **LLM+TTS phase** — LlmClient streams tokens → SentenceSplitter → PriorityPlaybackQueue
-3. **Loop** — returns to phase 1
+1. **Pre-STT VAD** — If queue has items (from HTTP channels), monitor mic and interrupt on speech. Loop until queue is empty.
+2. **STT phase** — WhisperStream listens until silence finalizes an utterance
+3. **LLM+TTS phase** — LlmClient streams tokens → SentenceSplitter → PriorityPlaybackQueue (channel="mic")
+4. **Wait phase** — Wait for queue to drain or VAD interrupt. Handle any pending response captures.
+5. **Loop** — returns to phase 1
 
 ### Pipeline (HTTP path)
 
 1. Agent POSTs to `/speak/{channel}`
-2. InboundServer creates SpeechRequest with channel's voice/priority
+2. InboundServer creates SpeechRequest with channel's voice/priority + optional wait_response/callback_url
 3. PriorityPlaybackQueue synthesizes and plays (may interrupt current audio)
+4. If wait_response: worker holds after playback → main loop captures speech → POSTs to callback
 
 ### Threading
 
 | Thread | Purpose |
 |--------|---------|
-| Main | Config, STT, LLM streaming |
-| Queue worker | Picks highest-priority request, synthesizes, plays |
+| Main | Config, STT, LLM streaming, pre-STT VAD polling, response capture |
+| Queue worker | Picks highest-priority request, synthesizes, plays; holds on wait_response |
 | HTTP server | Accepts /speak/ requests |
-| VAD monitor | Detects user speech during playback |
+| VAD monitor | Detects user speech during LLM+TTS phase for channel-aware interruption |
 
 ### Global state
 - `g_running` — app lifetime
@@ -106,6 +151,10 @@ curl -X POST localhost:8090/speak/assistant -H 'Content-Type: application/json' 
 # Test priority interruption:
 curl -X POST localhost:8090/speak/alert -H 'Content-Type: application/json' \
   -d '{"text": "Alert! Build failed"}'
+
+# Test wait-for-response:
+curl -X POST localhost:8090/speak/alert -H 'Content-Type: application/json' \
+  -d '{"text": "Build failed. Should I retry?", "wait_response": true, "callback_url": "http://localhost:9000/response"}'
 ```
 
 ### CLI options

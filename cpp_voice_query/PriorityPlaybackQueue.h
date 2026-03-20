@@ -38,11 +38,30 @@ public:
     // Stop processing. Interrupts current playback and drains the queue.
     void stop();
 
-    // Interrupt whatever is currently playing (e.g., called by VAD when user speaks).
+    // Interrupt whatever is currently playing (e.g., Ctrl+C signal handler — async-signal-safe).
     void interrupt_current();
 
-    // True if currently playing or has queued items.
+    // Interrupt all items from a specific channel: stops current if it matches,
+    // removes all queued items from that channel, cancels pending response if from that channel.
+    void interrupt_channel(const std::string& channel);
+
+    // Returns the channel name of the currently playing item (empty if idle).
+    std::string get_current_channel() const;
+
+    // True if currently playing, has queued items, or awaiting a response.
     bool is_active() const;
+
+    // --- Response capture API ---
+
+    // True if the last played item had wait_response and completed without interruption.
+    // The worker is held until complete_response() is called.
+    bool has_pending_response() const;
+
+    // Returns the callback URL for the pending response.
+    std::string get_pending_callback_url() const;
+
+    // Release the worker hold after the response has been captured and sent.
+    void complete_response();
 
 private:
     struct Impl;

@@ -14,7 +14,12 @@ struct SpeechRequest {
     Priority    priority    = Priority::NORMAL;
     std::string voice_path;   // path to Kokoro .bin voice file
     std::string language;     // espeak-ng language code, e.g. "pt-br", "en-us"
+    std::string channel;      // source channel identifier (e.g. "mic", "alert", "monitor")
     uint64_t    sequence    = 0; // monotonic ordering within same priority (assigned by queue)
+
+    // Per-request response capture: after playing, capture user speech and POST to callback_url
+    bool        wait_response  = false;
+    std::string callback_url;
 
     // For std::priority_queue: higher priority first, then earlier sequence first.
     bool operator<(const SpeechRequest& other) const {

@@ -122,8 +122,10 @@ cc_binary(
         "-lcuda",
     ],
     deps = [
+        ":curl",
         ":inbound_server",
         ":llm_client",
+        ":nlohmann_json",
         ":port_audio_source",
         ":priority_playback_queue",
         ":speech_request",

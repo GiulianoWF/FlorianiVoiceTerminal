@@ -70,6 +70,9 @@ struct InboundServer::Impl {
                 speech.priority = channel.priority;
                 speech.voice_path = channel.voice_path;
                 speech.language = channel.language;
+                speech.channel = channel.name;
+                speech.wait_response = body.value("wait_response", false);
+                speech.callback_url = body.value("callback_url", std::string(""));
                 queue.submit(std::move(speech));
 
                 res.status = 202;
@@ -131,6 +134,7 @@ struct InboundServer::Impl {
             speech.priority = channel.priority;
             speech.voice_path = channel.voice_path;
             speech.language = channel.language;
+            speech.channel = channel.name;
             queue.submit(std::move(speech));
         });
 
@@ -166,6 +170,7 @@ struct InboundServer::Impl {
             speech.priority = channel.priority;
             speech.voice_path = channel.voice_path;
             speech.language = channel.language;
+            speech.channel = channel.name;
             queue.submit(std::move(speech));
         }
     }
